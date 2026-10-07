@@ -7,7 +7,7 @@
 
 set -u
 
-# --- Dynamic & Resilient Defaults ---
+# --- Configurable Defaults ---
 CHECK_DNS="${CHECK_DNS:-kubernetes.default.svc}"
 SYSTEM_REGISTRY="${SYSTEM_REGISTRY:-image-registry.openshift-image-registry.svc:5000}"
 ADDITIONAL_REGISTRIES="${ADDITIONAL_REGISTRIES:-quay.io:443,registry.redhat.io:443}"
@@ -46,7 +46,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Select CLI binary
 if command -v oc >/dev/null 2>&1; then
     CLI="oc"
 elif command -v kubectl >/dev/null 2>&1; then
@@ -73,12 +72,22 @@ run_safe() {
     fi
 }
 
+# Proxy-aware endpoint probe
 probe_endpoint() {
     local target="$1"
     local host="${target%%:*}"
     local port="${target##*:}"
     [[ "${host}" == "${port}" ]] && port=443
 
+    if command -v curl >/dev/null 2>&1; then
+        if curl -s -k --connect-timeout 2 -m 3 -o /dev/null "https://${host}:${port}" 2>/dev/null || \
+           curl -s -k --connect-timeout 2 -m 3 -o /dev/null "http://${host}:${port}" 2>/dev/null; then
+            echo "OK"
+            return
+        fi
+    fi
+
+    # Fallback to direct raw socket
     if timeout 2 bash -c "</dev/tcp/${host}/${port}" 2>/dev/null; then
         echo "OK"
     else
@@ -86,18 +95,25 @@ probe_endpoint() {
     fi
 }
 
-# 1. Parallel API collection with resilient timeout bounds
-run_safe get clusterversion version -o jsonpath='{range .status.history[?(@.state=="Completed")]}{.version}{end}{"\t"}{.spec.clusterID}{"\t"}{.spec.channel}{"\t"}{range .status.conditions[?(@.type=="Progressing")]}{.status}{" "}{.message}{end}{"\t"}{range .status.conditions[?(@.type=="Upgradeable")]}{.status}{end}{"\t"}{range .status.availableUpdates[*]}{.version}{" "}{end}' > "${TMP_DIR}/cv" 2>"${TMP_DIR}/cv.err" &
-run_safe get infrastructure cluster -o jsonpath='{.status.platformStatus.type}{"\t"}{.status.controlPlaneTopology}' > "${TMP_DIR}/infra" 2>"${TMP_DIR}/infra.err" &
+# 1. Parallel API collection
+# ClusterVersion: query only the latest active history entry [0]
+run_safe get clusterversion version -o jsonpath='{.status.history[0].version}{"\t"}{.spec.clusterID}{"\t"}{.spec.channel}{"\t"}{range .status.conditions[?(@.type=="Progressing")]}{.status}{" "}{.message}{end}{"\t"}{range .status.conditions[?(@.type=="Upgradeable")]}{.status}{end}{"\t"}{range .status.availableUpdates[*]}{.version}{" "}{end}{"\n"}' > "${TMP_DIR}/cv" 2>"${TMP_DIR}/cv.err" &
+
+# Infrastructure with trailing newline
+run_safe get infrastructure cluster -o jsonpath='{.status.platformStatus.type}{"\t"}{.status.controlPlaneTopology}{"\n"}' > "${TMP_DIR}/infra" 2>"${TMP_DIR}/infra.err" &
+
 run_safe get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/nodes" 2>"${TMP_DIR}/nodes.err" &
 run_safe get co -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/co" 2>"${TMP_DIR}/co.err" &
 run_safe get mcp -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/mcp" 2>"${TMP_DIR}/mcp.err" &
 run_safe get csv -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}' > "${TMP_DIR}/csv" 2>"${TMP_DIR}/csv.err" &
-run_safe get pods -A --field-selector=status.phase!=Succeeded -o jsonpath='{range .items[*]}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/pods" 2>"${TMP_DIR}/pods.err" &
+
+# Fast Server-Side Table query for Pods
+run_safe get pods -A --no-headers > "${TMP_DIR}/pods" 2>"${TMP_DIR}/pods.err" &
+
 run_safe get pvc -A --no-headers > "${TMP_DIR}/pvc" 2>"${TMP_DIR}/pvc.err" &
 run_safe get events -A --field-selector type=Warning -o jsonpath='{range .items[*]}{.reason}{"\t"}{.series.lastObservedTime}{"\t"}{.lastTimestamp}{"\t"}{.eventTime}{"\t"}{.count}{"\n"}{end}' > "${TMP_DIR}/events" 2>"${TMP_DIR}/events.err" &
 run_safe get --raw "/api/v1/namespaces/openshift-monitoring/services/https:prometheus-k8s:9091/proxy/api/v1/alerts" > "${TMP_DIR}/alerts" 2>"${TMP_DIR}/alerts.err" &
-run_safe get ds ovnkube-node -n openshift-ovn-kubernetes -o jsonpath='{.status.desiredNumberScheduled}{"\t"}{.status.numberReady}' > "${TMP_DIR}/ovn" 2>"${TMP_DIR}/ovn.err" &
+run_safe get ds ovnkube-node -n openshift-ovn-kubernetes -o jsonpath='{.status.desiredNumberScheduled}{"\t"}{.status.numberReady}{"\n"}' > "${TMP_DIR}/ovn" 2>"${TMP_DIR}/ovn.err" &
 run_safe get storagecluster -A -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.cephClusteredConditions[?(@.type=="Ready")].status}{"\n"}{end}' > "${TMP_DIR}/odf" 2>"${TMP_DIR}/odf.err" &
 
 # Reachability probes
@@ -128,7 +144,7 @@ wait
 
 # 2. Parse Cluster Identity & Updates
 if [[ -s "${TMP_DIR}/cv" ]]; then
-    IFS=$'\t' read -r RAW_VER RAW_ID CHANNEL PROG_INFO UPGRADEABLE AVAIL_UPDATES < "${TMP_DIR}/cv"
+    IFS=$'\t' read -r RAW_VER RAW_ID CHANNEL PROG_INFO UPGRADEABLE AVAIL_UPDATES < "${TMP_DIR}/cv" || true
     VERSION="${RAW_VER:-Unknown}"
     CLUSTER_ID="${RAW_ID:-Unknown}"
     CHANNEL="${CHANNEL:-None/Disconnected}"
@@ -150,7 +166,13 @@ else
     UPDATE_STATUS="Unavailable"
 fi
 
-IFS=$'\t' read -r PLATFORM CP_TOPOLOGY < "${TMP_DIR}/infra" 2>/dev/null || { PLATFORM="Unknown"; CP_TOPOLOGY="Unknown"; }
+PLATFORM="Unknown"
+CP_TOPOLOGY="Unknown"
+if [[ -s "${TMP_DIR}/infra" ]]; then
+    IFS=$'\t' read -r PLATFORM CP_TOPOLOGY < "${TMP_DIR}/infra" || true
+    PLATFORM="${PLATFORM:-None}"
+fi
+
 IS_HCP=false
 [[ "${CP_TOPOLOGY}" =~ External|HostedControlPlane ]] && IS_HCP=true
 
@@ -208,7 +230,7 @@ fi
 
 # 7. OVN-Kubernetes: Total (NotReady)
 if [[ -s "${TMP_DIR}/ovn" ]]; then
-    IFS=$'\t' read -r OVN_DESIRED OVN_READY < "${TMP_DIR}/ovn"
+    IFS=$'\t' read -r OVN_DESIRED OVN_READY < "${TMP_DIR}/ovn" || true
     OVN_DESIRED="${OVN_DESIRED:-0}"
     OVN_READY="${OVN_READY:-0}"
     OVN_NOT_READY=$(( OVN_DESIRED - OVN_READY ))
@@ -262,15 +284,19 @@ else
     ALERT_SUMMARY="Unavailable (Monitoring API unreachable)"
 fi
 
-# 11. Pod Anomalies
-if [[ -s "${TMP_DIR}/pods" ]]; then
-    CRASHLOOP=$(grep -o "CrashLoopBackOff" "${TMP_DIR}/pods" | wc -l | tr -d ' ')
-    IMAGEPULL=$(grep -E -o "ImagePullBackOff|ErrImagePull" "${TMP_DIR}/pods" | wc -l | tr -d ' ')
-    CREATE_ERR=$(grep -o "CreateContainerConfigError" "${TMP_DIR}/pods" | wc -l | tr -d ' ')
-    PENDING=$(awk -F'\t' '$1 == "Pending"' "${TMP_DIR}/pods" | wc -l | tr -d ' ')
-    FAILED=$(awk -F'\t' '$1 == "Failed"' "${TMP_DIR}/pods" | wc -l | tr -d ' ')
+# 11. Pod Anomalies (Parsed from fast Server-Side Table)
+if [[ -f "${TMP_DIR}/pods" && ! -s "${TMP_DIR}/pods.err" ]]; then
+    CRASHLOOP=$(grep -c "CrashLoopBackOff" "${TMP_DIR}/pods" || true)
+    IMAGEPULL=$(grep -c -E "ImagePullBackOff|ErrImagePull" "${TMP_DIR}/pods" || true)
+    CREATE_ERR=$(grep -c "CreateContainerConfigError" "${TMP_DIR}/pods" || true)
+    PENDING=$(awk '$4 == "Pending"' "${TMP_DIR}/pods" | wc -l | tr -d ' ')
+    FAILED=$(awk '$4 ~ /Error|Failed/' "${TMP_DIR}/pods" | wc -l | tr -d ' ')
 else
-    CRASHLOOP="?"; IMAGEPULL="?"; CREATE_ERR="?"; PENDING="?"; FAILED="?"
+    CRASHLOOP="?"
+    IMAGEPULL="?"
+    CREATE_ERR="?"
+    PENDING="?"
+    FAILED="?"
 fi
 
 # 12. Warning Events (In-memory Awk)
@@ -314,7 +340,7 @@ fi
 cat <<EOF
 === min-gather summary ===
 Cluster ID:          ${CLUSTER_ID}
-Platform:            ${PLATFORM:-Unknown}$([[ "${IS_HCP}" == "true" ]] && echo " (HostedControlPlane)")
+Platform:            ${PLATFORM}$([[ "${IS_HCP}" == "true" ]] && echo " (HostedControlPlane)")
 Cluster Version:     ${VERSION}
 Update Status:       ${UPDATE_STATUS}
 
@@ -345,6 +371,5 @@ Pod Anomalies:
 
 Top 5 Warning Events (Last ${WINDOW_MINUTES}m):
 ${FORMATTED_WARNINGS}
-
 ==========================
 EOF
