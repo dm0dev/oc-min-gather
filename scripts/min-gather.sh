@@ -2,23 +2,23 @@
 #
 # Project:    oc-min-gather
 # Executable: min-gather
-# Description: High-speed, read-only OpenShift & HCP diagnostic snapshot for SRE triage.
+# Description: High-speed OpenShift & HCP diagnostic snapshot for SRE triage.
 #
 
 set -u
 
-# --- Configurable Defaults (Override via ENV or CLI Flags) ---
-CHECK_DNS="${CHECK_DNS:-api.crc.testing}"
-SYSTEM_REGISTRY="${SYSTEM_REGISTRY:-default-route-openshift-image-registry.apps-crc.testing:443}"
+# --- Dynamic & Resilient Defaults ---
+CHECK_DNS="${CHECK_DNS:-kubernetes.default.svc}"
+SYSTEM_REGISTRY="${SYSTEM_REGISTRY:-image-registry.openshift-image-registry.svc:5000}"
 ADDITIONAL_REGISTRIES="${ADDITIONAL_REGISTRIES:-quay.io:443,registry.redhat.io:443}"
 WINDOW_MINUTES="${WINDOW_MINUTES:-30}"
-TIMEOUT_SEC="${TIMEOUT_SEC:-3}"
+TIMEOUT_SEC="${TIMEOUT_SEC:-10}"
 
 show_help() {
     cat <<EOF
 Usage: min-gather [OPTIONS]
 
-Ultra-fast, parallelized OpenShift health snapshot for ticket submission.
+High-speed OpenShift cluster health snapshot for ticket submission.
 
 Options:
   -d, --dns <host>             Target host for DNS lookup check (Default: ${CHECK_DNS})
@@ -34,7 +34,6 @@ EOF
     exit 0
 }
 
-# Parse CLI arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -d|--dns)        CHECK_DNS="$2"; shift 2 ;;
@@ -58,16 +57,20 @@ else
 fi
 
 if ! ${CLI} whoami >/dev/null 2>&1; then
-    echo "Error: Cluster unauthenticated. Please login first." >&2
+    echo "Error: Cluster unauthenticated. Please run 'oc login' first." >&2
     exit 1
 fi
 
-TMP_DIR=$(mktemp -d)
+TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'mg.XXXXXX')
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 run_safe() {
-    timeout --kill-after=1s "${TIMEOUT_SEC}s" \
-        ${CLI} --request-timeout="${TIMEOUT_SEC}s" "$@"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --kill-after=1s "${TIMEOUT_SEC}s" \
+            "${CLI}" --request-timeout="${TIMEOUT_SEC}s" "$@"
+    else
+        "${CLI}" --request-timeout="${TIMEOUT_SEC}s" "$@"
+    fi
 }
 
 probe_endpoint() {
@@ -83,21 +86,19 @@ probe_endpoint() {
     fi
 }
 
-# 1. Parallel API collection
-run_safe get clusterversion version -o jsonpath='{range .status.history[?(@.state=="Completed")]}{.version}{end}{"\t"}{.spec.clusterID}{"\t"}{.spec.channel}{"\t"}{range .status.conditions[?(@.type=="Progressing")]}{.status}{" "}{.message}{end}{"\t"}{range .status.conditions[?(@.type=="Upgradeable")]}{.status}{end}{"\t"}{range .status.availableUpdates[*]}{.version}{" "}{end}' > "${TMP_DIR}/cv" 2>/dev/null &
-run_safe get infrastructure cluster -o jsonpath='{.status.platformStatus.type}{"\t"}{.status.controlPlaneTopology}' > "${TMP_DIR}/infra" 2>/dev/null &
-run_safe get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/nodes" 2>/dev/null &
-run_safe get co -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/co" 2>/dev/null &
-run_safe get mcp -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/mcp" 2>/dev/null &
-run_safe get csv -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}' > "${TMP_DIR}/csv" 2>/dev/null &
-run_safe get pods -A -o jsonpath='{range .items[*]}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/pods" 2>/dev/null &
-run_safe get pvc -A --no-headers > "${TMP_DIR}/pvc" 2>/dev/null &
-run_safe get events -A --field-selector type=Warning -o jsonpath='{range .items[*]}{.reason}{"\t"}{.series.lastObservedTime}{"\t"}{.lastTimestamp}{"\t"}{.eventTime}{"\t"}{.count}{"\n"}{end}' > "${TMP_DIR}/events" 2>/dev/null &
-run_safe get --raw "/api/v1/namespaces/openshift-monitoring/services/https:prometheus-k8s:9091/proxy/api/v1/alerts" > "${TMP_DIR}/alerts" 2>/dev/null &
-
-# OVN & ODF
-run_safe get ds ovnkube-node -n openshift-ovn-kubernetes -o jsonpath='{.status.desiredNumberScheduled}{"\t"}{.status.numberReady}' > "${TMP_DIR}/ovn" 2>/dev/null &
-run_safe get storagecluster -A -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.cephClusteredConditions[?(@.type=="Ready")].status}{"\n"}{end}' > "${TMP_DIR}/odf" 2>/dev/null &
+# 1. Parallel API collection with resilient timeout bounds
+run_safe get clusterversion version -o jsonpath='{range .status.history[?(@.state=="Completed")]}{.version}{end}{"\t"}{.spec.clusterID}{"\t"}{.spec.channel}{"\t"}{range .status.conditions[?(@.type=="Progressing")]}{.status}{" "}{.message}{end}{"\t"}{range .status.conditions[?(@.type=="Upgradeable")]}{.status}{end}{"\t"}{range .status.availableUpdates[*]}{.version}{" "}{end}' > "${TMP_DIR}/cv" 2>"${TMP_DIR}/cv.err" &
+run_safe get infrastructure cluster -o jsonpath='{.status.platformStatus.type}{"\t"}{.status.controlPlaneTopology}' > "${TMP_DIR}/infra" 2>"${TMP_DIR}/infra.err" &
+run_safe get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/nodes" 2>"${TMP_DIR}/nodes.err" &
+run_safe get co -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/co" 2>"${TMP_DIR}/co.err" &
+run_safe get mcp -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/mcp" 2>"${TMP_DIR}/mcp.err" &
+run_safe get csv -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}' > "${TMP_DIR}/csv" 2>"${TMP_DIR}/csv.err" &
+run_safe get pods -A --field-selector=status.phase!=Succeeded -o jsonpath='{range .items[*]}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}{"\n"}{end}' > "${TMP_DIR}/pods" 2>"${TMP_DIR}/pods.err" &
+run_safe get pvc -A --no-headers > "${TMP_DIR}/pvc" 2>"${TMP_DIR}/pvc.err" &
+run_safe get events -A --field-selector type=Warning -o jsonpath='{range .items[*]}{.reason}{"\t"}{.series.lastObservedTime}{"\t"}{.lastTimestamp}{"\t"}{.eventTime}{"\t"}{.count}{"\n"}{end}' > "${TMP_DIR}/events" 2>"${TMP_DIR}/events.err" &
+run_safe get --raw "/api/v1/namespaces/openshift-monitoring/services/https:prometheus-k8s:9091/proxy/api/v1/alerts" > "${TMP_DIR}/alerts" 2>"${TMP_DIR}/alerts.err" &
+run_safe get ds ovnkube-node -n openshift-ovn-kubernetes -o jsonpath='{.status.desiredNumberScheduled}{"\t"}{.status.numberReady}' > "${TMP_DIR}/ovn" 2>"${TMP_DIR}/ovn.err" &
+run_safe get storagecluster -A -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.cephClusteredConditions[?(@.type=="Ready")].status}{"\n"}{end}' > "${TMP_DIR}/odf" 2>"${TMP_DIR}/odf.err" &
 
 # Reachability probes
 (
@@ -158,10 +159,10 @@ if [[ -s "${TMP_DIR}/nodes" ]]; then
     TOTAL_NODES=$(wc -l < "${TMP_DIR}/nodes" | tr -d ' ')
     READY_NODES=$(grep -c "Ready=True" "${TMP_DIR}/nodes" || true)
     NOT_READY_NODES=$(( TOTAL_NODES - READY_NODES ))
-
+    
     PRESSURE_NODES=$(awk -F'\t' '$2 ~ /DiskPressure=True/ || $2 ~ /MemoryPressure=True/ || $2 ~ /PIDPressure=True/ {print $1}' "${TMP_DIR}/nodes")
     PRESSURE_COUNT=$(echo "${PRESSURE_NODES}" | grep -c . || true)
-
+    
     NODES_SUMMARY="${TOTAL_NODES} Total (${NOT_READY_NODES} NotReady, ${PRESSURE_COUNT} Under Pressure)"
 else
     NODES_SUMMARY="Unavailable"
@@ -294,7 +295,7 @@ else
     FORMATTED_WARNINGS=" - Timed out or no events available"
 fi
 
-# 13. Normalized Reachability Parsing
+# 13. Reachability Parsing
 PROBE_DNS_STATUS=$(cat "${TMP_DIR}/probe_dns" 2>/dev/null || echo "FAIL")
 PROBE_SYS_STATUS=$(cat "${TMP_DIR}/probe_sys_reg" 2>/dev/null || echo "FAIL")
 
