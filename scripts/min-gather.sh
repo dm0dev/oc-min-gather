@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#
-# Project:    oc-min-gather
-# Executable: min-gather
+# Version:     v0.3
+# Project:     oc-min-gather
+# Executable:  min-gather
 # Description: High-speed OpenShift & HCP diagnostic snapshot with ICSP/IDMS auto-discovery.
 #
 
